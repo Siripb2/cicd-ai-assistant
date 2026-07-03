@@ -1,0 +1,132 @@
+# Example: drop this into ANY repository's existing CI workflow to get
+# AI-powered root-cause analysis posted as a PR comment whenever a job fails.
+#
+# This file is illustrative — copy the `analyze-on-failure` job into your
+# own workflow YAML, adjacent to your existing build/test job.
+
+name: Build and Test (with AI failure analysis)
+
+on:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run build & tests
+        id: build
+        run: |
+          # your actual build/test commands here
+          npm ci && npm test
+
+  analyze-on-failure:
+    # Runs only when build-and-test fails. Does NOT affect the overall
+    # workflow conclusion -- it is purely observational/reporting.
+    needs: build-and-test
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      actions: read
+      contents: read
+    steps:
+      - name: Download full workflow run logs and extract failed job
+        id: fetch_logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TMP_ZIP=$(mktemp)
+          echo "Downloading workflow run logs..."
+          # GitHub API returns a redirect to the zip file; follow it
+          curl -sS -L -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/logs" -o "$TMP_ZIP"
+          mkdir -p run_logs
+          unzip -q "$TMP_ZIP" -d run_logs || true
+
+          # Find failed job name via API
+          JOB_NAME=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            | jq -r '.jobs[] | select(.conclusion=="failure") | .name' | head -n1)
+          if [ -z "$JOB_NAME" ]; then
+            JOB_NAME=""
+          fi
+
+          # Try to locate the log file that matches the job name; fallback to first txt
+          if [ -n "$JOB_NAME" ]; then
+            LOG_FILE=$(find run_logs -type f -name "*.txt" | grep -i "${JOB_NAME// /.*}" | head -n1 || true)
+          fi
+          LOG_FILE=${LOG_FILE:-$(find run_logs -type f -name "*.txt" | head -n1 || true)}
+
+          if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
+            # Trim to last 20000 characters to keep payload reasonable
+            tail -c 20000 "$LOG_FILE" > failure.log || true
+            echo "Saved trimmed log to failure.log"
+          else
+            echo "No job log file found; will reference workflow run URL instead" > failure.log
+          fi
+
+          # Export metadata for next step
+          echo "JOB_NAME=${JOB_NAME}" >> $GITHUB_ENV
+          echo "LOG_PATH=failure.log" >> $GITHUB_ENV
+
+      - name: Send log to AI Assistant for analysis
+        id: call_ai
+        env:
+          API_URL: ${{ secrets.CICD_ASSISTANT_API_URL }}
+          ASSISTANT_API_KEY: ${{ secrets.CICD_ASSISTANT_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          LOG_JSON=$(jq -Rs . < "$LOG_PATH")
+          PAYLOAD=$(jq -n \
+              --arg pipeline "${JOB_NAME:-unknown}" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg commit_sha "$GITHUB_SHA" \
+              --arg run_url "$GITHUB_RUN_URL" \
+              --argjson log $LOG_JSON \
+              '{pipeline_name: $pipeline, repository: $repository, commit_sha: $commit_sha, run_url: $run_url, log: $log}')
+
+          echo "Sending payload to AI Assistant (trimmed log)..."
+          curl -sS -X POST "$API_URL/analyze" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: $ASSISTANT_API_KEY" \
+            -d "$PAYLOAD" -o analysis.json || (echo "API call failed" && cat analysis.json || true)
+
+      - name: Post analysis as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const analysis = JSON.parse(fs.readFileSync('analysis.json', 'utf8'));
+            const lowConfidence = analysis.low_confidence_warning ? '\n\n> :warning: Low-confidence analysis - verify before applying.' : '';
+            const confidence = analysis.confidence ? `${Math.round(analysis.confidence*100)}%` : 'n/a';
+            const commit = analysis.commit_sha || process.env.GITHUB_SHA || 'n/a';
+            const runUrl = analysis.run_url || `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            const body = [
+              '### 🤖 CI/CD AI Assistant — Failure Analysis',
+              `**Status:** ANALYZED  |  **Confidence:** ${confidence}  |  **Commit:** ${commit}`,
+              '',
+              '**🔍 Root Cause**',
+              analysis.root_cause || 'Could not be determined',
+              '',
+              '**📦 Affected Component**',
+              analysis.affected_component || 'n/a',
+              '',
+              '**🛠️ Suggested Fix**',
+              analysis.fix_suggestion || 'n/a',
+              lowConfidence,
+              '',
+              `[View full workflow run](${runUrl})  •  Powered by CI/CD AI Assistant`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
