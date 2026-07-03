@@ -20,6 +20,8 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini .
 
+RUN chown -R appuser:appuser /app
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

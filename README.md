@@ -81,6 +81,8 @@ Visit `http://localhost:8000/docs` for interactive API docs.
 docker compose up --build
 ```
 
+> Note: the default database is SQLite at `./pipeline_analysis.db`. In a container, make sure the app can write to the working directory or override `DATABASE_URL` to a writable path such as `sqlite:////tmp/pipeline_analysis.db`.
+
 ## Running tests
 
 ```bash
