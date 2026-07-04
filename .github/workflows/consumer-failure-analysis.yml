@@ -93,6 +93,7 @@ jobs:
             const commit = analysis.commit_sha || process.env.GITHUB_SHA || 'n/a';
             const runUrl = analysis.run_url || `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
 
+            const extraContext = analysis.additional_context ? ['\n**⚠️ Analysis note**', analysis.additional_context] : [];
             const body = [
               '### 🤖 CI/CD AI Assistant — Failure Analysis',
               `**Status:** ANALYZED  |  **Confidence:** ${confidence}  |  **Commit:** ${commit}`,
@@ -106,6 +107,7 @@ jobs:
               '**🛠️ Suggested Fix**',
               analysis.fix_suggestion || 'n/a',
               lowConfidence,
+              ...extraContext,
               '',
               `[View full workflow run](${runUrl})  •  Powered by CI/CD AI Assistant`
             ].join('\n');

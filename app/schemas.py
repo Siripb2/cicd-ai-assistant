@@ -25,6 +25,7 @@ class AnalyzeResponse(BaseModel):
     fix_suggestion: str | None = None
     confidence_level: float | None = None
     low_confidence_warning: bool = False
+    additional_context: str | None = None
 
 
 class ReportOut(BaseModel):

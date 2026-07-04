@@ -38,4 +38,5 @@ def analyze_failure(payload: AnalyzeRequest, db: Session = Depends(get_db)) -> A
         fix_suggestion=record.fix_suggestion,
         confidence_level=record.confidence_level,
         low_confidence_warning=is_low_confidence(record.confidence_level),
+        additional_context=record.error_message,
     )
