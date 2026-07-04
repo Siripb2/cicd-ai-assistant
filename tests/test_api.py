@@ -38,6 +38,25 @@ def test_analyze_endpoint_validates_input(client):
     assert resp.status_code == 422
 
 
+def test_analyze_endpoint_falls_back_to_heuristic_analysis_when_gemini_is_unavailable(client):
+    payload = {
+        "pipeline_name": "backend-ci",
+        "log": "ERROR: No matching distribution found for pandas==99.0.0\nFAILED build step: pip install",
+    }
+    with patch.object(
+        analyze_router._gemini_client.__class__, "generate", side_effect=RuntimeError("gemini unavailable")
+    ):
+        resp = client.post("/analyze", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ANALYZED"
+    assert body["root_cause"] is not None
+    assert "pandas" in body["root_cause"].lower()
+    assert body["affected_component"] == "dependency resolution"
+    assert body["fix_suggestion"] is not None
+    assert body["low_confidence_warning"] is True
+
+
 @patch.object(analyze_router._gemini_client.__class__, "generate", _mock_generate_success)
 def test_reports_pagination(client):
     payload = {"pipeline_name": "ci", "log": "some error"}
