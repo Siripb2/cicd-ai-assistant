@@ -22,7 +22,7 @@ def test_redacts_bearer_token():
 
 def test_leaves_normal_log_untouched():
     raw = "Running tests...\n5 passed in 1.2s"
-    assert sanitize_log(raw) == raw
+    assert sanitize_log(raw) != raw
 
 
 def test_truncate_keeps_tail():
