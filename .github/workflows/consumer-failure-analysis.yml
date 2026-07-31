@@ -1,118 +1,116 @@
-name: AI Failure Analysis
+name: CI with AI Failure Analysis
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run build & tests
-        id: build
-        run: |
-          # Replace this with your repository's real build/test commands.
-          npm ci && npm test
-
-  analyze-on-failure:
-    needs: build-and-test
-    if: failure()
+  build-test-and-analyze:
+    name: Build, Test, and Analyze on Failure
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-      actions: read
       contents: read
+
     steps:
-      - name: Download workflow run logs
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        id: run_tests
         run: |
-          set -euo pipefail
-          TMP_ZIP=$(mktemp)
-          echo "Downloading workflow run logs..."
-          curl -sS -L -H "Authorization: token ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/logs" \
-            -o "$TMP_ZIP"
-          mkdir -p run_logs
-          unzip -q "$TMP_ZIP" -d run_logs || true
+          set -o pipefail
+          pytest --tb=long -v 2>&1 | tee build.log
 
-          JOB_NAME=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
-            | jq -r '.jobs[] | select(.conclusion=="failure") | .name' | head -n1)
-          JOB_NAME=${JOB_NAME:-unknown}
-
-          if [ "$JOB_NAME" != "unknown" ]; then
-            LOG_FILE=$(find run_logs -type f -name "*.txt" | grep -i "${JOB_NAME// /.*}" | head -n1 || true)
-          fi
-          LOG_FILE=${LOG_FILE:-$(find run_logs -type f -name "*.txt" | head -n1 || true)}
-
-          if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
-            tail -c 20000 "$LOG_FILE" > failure.log || true
-            echo "Saved trimmed log to failure.log"
-          else
-            echo "No failed job log file found; using workflow run URL instead" > failure.log
-          fi
-
-          echo "JOB_NAME=$JOB_NAME" >> $GITHUB_ENV
-          echo "LOG_PATH=failure.log" >> $GITHUB_ENV
-
-      - name: Send log to AI Assistant for analysis
+      - name: Send failure log to CI/CD AI Assistant
+        id: analysis
+        if: failure() && steps.run_tests.outcome == 'failure'
         env:
           API_URL: ${{ secrets.CICD_ASSISTANT_API_URL }}
-          ASSISTANT_API_KEY: ${{ secrets.CICD_ASSISTANT_API_KEY }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          API_KEY: ${{ secrets.CICD_ASSISTANT_API_KEY }}
         run: |
-          set -euo pipefail
-          LOG_JSON=$(jq -Rs . < "$LOG_PATH")
+          if [ -f build.log ]; then
+            LOG_CONTENT=$(tail -c 6000 build.log)
+          else
+            LOG_CONTENT="build.log was not found on disk after the test step failed."
+          fi
+
           PAYLOAD=$(jq -n \
-            --arg pipeline "${JOB_NAME:-unknown}" \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg commit_sha "$GITHUB_SHA" \
-            --arg run_url "$GITHUB_RUN_URL" \
-            --argjson log "$LOG_JSON" \
-            '{pipeline_name: $pipeline, repository: $repository, commit_sha: $commit_sha, run_url: $run_url, log: $log}')
+            --arg pipeline "${{ github.workflow }}" \
+            --arg repo     "${{ github.repository }}" \
+            --arg sha      "${{ github.sha }}" \
+            --arg log      "$LOG_CONTENT" \
+            '{
+              pipeline_name: $pipeline,
+              repository:    $repo,
+              commit_sha:    $sha,
+              log:           $log,
+              org_id:        "default"
+            }')
 
-          echo "Sending analysis request to AI Assistant..."
-          curl -sS -X POST "$API_URL/analyze" \
+          echo "----- Payload log preview (first 300 chars) -----"
+          echo "$LOG_CONTENT" | head -c 300
+          echo ""
+
+          HTTP_STATUS=$(curl -s -o analysis.json -w "%{http_code}" \
+            -X POST "$API_URL/analyze" \
             -H "Content-Type: application/json" \
-            -H "X-API-Key: $ASSISTANT_API_KEY" \
+            -H "X-API-Key: $API_KEY" \
             -d "$PAYLOAD" \
-            -o analysis.json
+            --max-time 60)
 
-      - name: Post analysis as PR comment
+          echo "HTTP status: $HTTP_STATUS"
+          cat analysis.json
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo '{"status":"FAILED","root_cause":null,"fix_suggestion":"AI Assistant API was unreachable.","confidence_level":null,"low_confidence_warning":true}' > analysis.json
+          fi
+
+      - name: Post AI analysis as PR comment
+        if: failure() && steps.run_tests.outcome == 'failure' && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const analysisJson = fs.readFileSync('analysis.json', 'utf8');
-            const analysis = JSON.parse(analysisJson);
-            const lowConfidence = analysis.low_confidence_warning ? '\n\n> :warning: Low-confidence analysis - verify before applying.' : '';
-            const confidence = analysis.confidence ? `${Math.round(analysis.confidence * 100)}%` : 'n/a';
-            const commit = analysis.commit_sha || process.env.GITHUB_SHA || 'n/a';
-            const runUrl = analysis.run_url || `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            let analysis;
+            try {
+              analysis = JSON.parse(fs.readFileSync('analysis.json', 'utf8'));
+            } catch (e) {
+              analysis = { status: 'FAILED', root_cause: null, fix_suggestion: 'Could not parse AI Assistant response.', confidence_level: null, low_confidence_warning: true };
+            }
 
-            const body = [
-              '### 🤖 CI/CD AI Assistant — Failure Analysis',
-              `**Status:** ANALYZED  |  **Confidence:** ${confidence}  |  **Commit:** ${commit}`,
+            const status = analysis.status || 'UNKNOWN';
+            const rootCause = analysis.root_cause || '_Could not be determined_';
+            const component = analysis.affected_component || 'n/a';
+            const fix = analysis.fix_suggestion || '_No suggestion available_';
+            const confidence = analysis.confidence_level != null ? `${(analysis.confidence_level * 100).toFixed(0)}%` : 'n/a';
+            const sha = context.sha.slice(0, 7);
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const statusEmoji = status === 'ANALYZED' ? '✅' : '❌';
+
+            const bodyLines = [
+              '## 🤖 CI/CD AI Assistant — Failure Analysis',
               '',
-              '**🔍 Root Cause**',
-              analysis.root_cause || 'Could not be determined',
-              '',
-              '**📦 Affected Component**',
-              analysis.affected_component || 'n/a',
-              '',
-              '**🛠️ Suggested Fix**',
-              analysis.fix_suggestion || 'n/a',
-              lowConfidence,
-              '',
-              `[View full workflow run](${runUrl})  •  Powered by CI/CD AI Assistant`
-            ].join('\n');
+              `${statusEmoji} **Status:** ${status} \u00a0|\u00a0 🎯 **Confidence:** ${confidence} \u00a0|\u00a0 📝 **Commit:** \`${sha}\``,
+            ];
+            if (analysis.low_confidence_warning) {
+              bodyLines.push('', '> ⚠️ **Low confidence** — verify before applying.');
+            }
+            bodyLines.push('', '---', '', '### 🔍 Root Cause', rootCause, '', '### 📦 Affected Component', component, '', '### 🛠️ Suggested Fix', fix, '', '---', `<sub>🔗 [View run](${runUrl})</sub>`);
+            const body = bodyLines.join('\n');
 
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body,
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body,
             });
+
+      - name: Fail job if tests failed
+        if: steps.run_tests.outcome == 'failure'
+        run: exit 1
